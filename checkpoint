@@ -1,3 +1,0 @@
-model_checkpoint_path: "/Users/andi/.local/share/deepspeech/ldc93s1/model.ckpt-50"
-all_model_checkpoint_paths: "/Users/andi/.local/share/deepspeech/ldc93s1/model.ckpt-0"
-all_model_checkpoint_paths: "/Users/andi/.local/share/deepspeech/ldc93s1/model.ckpt-50"

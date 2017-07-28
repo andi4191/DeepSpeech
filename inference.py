@@ -1,0 +1,290 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import, division, print_function
+import numpy as np
+import os
+import pickle
+import tensorflow as tf
+import sys
+import inspect
+from util.audio import audiofile_to_input_vector
+from util.text import ctc_label_dense_to_sparse, text_to_char_array, ndarray_to_text
+from util.spell import correction
+import csv
+
+tf.app.flags.DEFINE_integer('batch_size',     '1',     'batch_size for inference')
+tf.app.flags.DEFINE_integer('n_hidden',     '494',     'batch_size for inference')
+tf.app.flags.DEFINE_string('dataset',          '',     'dataset to infer')
+FLAGS = tf.app.flags.FLAGS
+
+class Codebook():
+
+    def __init__(self, codebook_path, session=None):
+        self.codebook = {}
+        self.codebook_path = codebook_path
+        self.filename = os.path.join(self.codebook_path, 'codebook_file')
+
+    def load_codebook(self):
+        with open(self.filename, 'rb') as fin:
+            self.codebook = pickle.load(fin)
+
+    def reconstruct_param(self):
+        param = {}
+        for p in self.codebook.keys():
+            dic = {}
+            for idx, i in enumerate(self.codebook[p][0]):
+                dic[idx] = i
+            # Reconstructing the cluster index from codebook dictionary
+            param[p] = np.vectorize(dic.__getitem__)(self.codebook[p][1]).astype(np.float32)
+
+        return param
+
+
+class Data():
+    def __init__(self, data_dir):
+
+        self.dataset_dir = data_dir
+
+    def get_data(self):
+        csv_file_list = [os.path.join(self.dataset_dir, f) for f in os.listdir(self.dataset_dir) if f.endswith('.csv')]
+        if len(csv_file_list) == 0:
+            print('No csv files found')
+            sys.exit()
+
+        data = []
+        for files in csv_file_list:
+            with open(files) as f:
+                reader = csv.reader(f, delimiter=',', quoting=csv.QUOTE_NONE)
+                for row in reader:
+                    data.append((row[0], row[1], row[2]))
+
+        data.pop(0)
+
+        return data
+
+
+class Infer():
+
+    def __init__(self, param, batch_size):
+        self._param = param
+        self.session = tf.Session()
+        self.n_context = 9
+        self.n_input = 26
+        self.random_seed = tf.set_random_seed(4567)
+        self.stddev = 0.046875
+        self.relu_clip = 20
+
+        self.n_hidden = FLAGS.n_hidden
+        self.n_hidden_6 = 29
+        self.no_dropout = [ 0.0 ] * 6
+        self.n_cell_dim = self.n_hidden
+        self.batch_size = batch_size
+
+        # Parse and modify the input to compatible format
+        self.target = tf.placeholder(tf.int32, [self.batch_size, None])
+        self.target_len = tf.placeholder(tf.int32, [self.batch_size])
+
+    def set_data_set(self, data):
+        self.input_vec, self.input_vec_len, self.label, self.label_len, self.transcript = self.retrieve_data(data)
+
+    def retrieve_data(self, data):
+        wav_file, _, transcript = data
+
+        # Get the input from the wav_file
+        input_vec = audiofile_to_input_vector(wav_file, self.n_input, self.n_context)
+
+        # Convert the transcript to array
+        target = text_to_char_array(transcript)
+
+        return input_vec, len(input_vec), target, len(target), transcript
+
+
+    def get_label(self):
+
+        # Reshape the target label
+        self.label = np.reshape(self.label, (self.batch_size, -1))
+        self.label_len = np.reshape(self.label_len, (self.batch_size))
+
+        feed_dict = {self.target: self.label, self.target_len: self.label_len}
+
+        # Generate the Sparse Tensor for computation of CTC loss
+        sparse_labels  = ctc_label_dense_to_sparse(self.target, self.target_len, self.batch_size)
+        self.session.run([sparse_labels], feed_dict=feed_dict)
+
+        return sparse_labels
+
+
+    def BiRNN(self, batch_x, seq_length, dropout):
+        batch_x_shape = tf.shape(batch_x)
+
+        # Reshaping `batch_x` to a tensor with shape `[n_steps*batch_size, n_input + 2*n_input*n_context]`.
+        # This is done to prepare the batch for input into the first layer which expects a tensor of rank `2`.
+
+        # Permute n_steps and batch_size
+        batch_x = tf.transpose(batch_x, [1, 0, 2])
+        # Reshape to prepare input for first layer
+        batch_x = tf.reshape(batch_x, [-1, self.n_input + 2*self.n_input*self.n_context])
+
+        # The next three blocks will pass `batch_x` through three hidden layers with
+        # clipped RELU activation and dropout.
+
+        # 1st layer
+        h1 = tf.get_variable('h1', initializer=tf.constant(self._param['h1']))
+        b1 = tf.get_variable('b1', initializer=tf.constant(self._param['b1']))
+        layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(tf.cast(batch_x, tf.float32), h1), b1)), self.relu_clip)
+        layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
+
+        # 2nd layer
+        h2 = tf.get_variable('h2', initializer=tf.constant(self._param['h2']))
+        b2 = tf.get_variable('b2', initializer=tf.constant(self._param['b2']))
+        layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), self.relu_clip)
+        layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
+
+        # 3rd layer
+        b3 = tf.get_variable('b3', initializer=tf.constant(self._param['b3']))
+        h3 = tf.get_variable('h3', initializer=tf.constant(self._param['h3']))
+        layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), self.relu_clip)
+        layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
+
+        # Now we create the forward and backward LSTM units.
+        # Both of which have inputs of length `n_cell_dim` and bias `1.0` for the forget gate of the LSTM.
+
+        # Forward direction cell: (if else required for TF 1.0 and 1.1 compat)
+        lstm_fw_cell = tf.contrib.rnn.BasicLSTMCell(self.n_cell_dim, forget_bias=1.0, state_is_tuple=True) \
+                       if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
+                       tf.contrib.rnn.BasicLSTMCell(self.n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
+        lstm_fw_cell = tf.contrib.rnn.DropoutWrapper(lstm_fw_cell,
+                       input_keep_prob=1.0 - dropout[3],
+                       output_keep_prob=1.0 - dropout[3],
+                       seed=self.random_seed)
+        # Backward direction cell: (if else required for TF 1.0 and 1.1 compat)
+        lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(self.n_cell_dim, forget_bias=1.0, state_is_tuple=True) \
+                       if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
+                       tf.contrib.rnn.BasicLSTMCell(self.n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
+        lstm_bw_cell = tf.contrib.rnn.DropoutWrapper(lstm_bw_cell,
+                                                     input_keep_prob=1.0 - dropout[4],
+                                                     output_keep_prob=1.0 - dropout[4],
+                                                     seed=self.random_seed)
+
+        # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
+        # as the LSTM BRNN expects its input to be of shape `[max_time, batch_size, input_size]`.
+        layer_3 = tf.reshape(layer_3, [-1, batch_x_shape[0], self.n_hidden*2])
+
+        # Now we feed `layer_3` into the LSTM BRNN cell and obtain the LSTM BRNN output.
+        outputs, output_states = tf.nn.bidirectional_dynamic_rnn(cell_fw=lstm_fw_cell,
+                                                                 cell_bw=lstm_bw_cell,
+                                                                 inputs=layer_3,
+                                                                 dtype=tf.float32,
+                                                                 time_major=True,
+                                                                 sequence_length=seq_length)
+
+        # Reshape outputs from two tensors each of shape [n_steps, batch_size, n_cell_dim]
+        # to a single tensor of shape [n_steps*batch_size, 2*n_cell_dim]
+        outputs = tf.concat(outputs, 2)
+        outputs = tf.reshape(outputs, [-1, 2*self.n_cell_dim])
+
+        # Now we feed `outputs` to the fifth hidden layer with clipped RELU activation and dropout
+        b5 = tf.get_variable('b5', initializer=tf.constant(self._param['b5']))
+        h5 = tf.get_variable('h5', initializer = self._param['h5'])
+        layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, h5), b5)), self.relu_clip)
+        layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
+
+        # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
+        # creating `n_classes` dimensional vectors, the logits.
+        b6 = tf.get_variable('b6', initializer=tf.constant(self._param['b6']))
+        h6 = tf.get_variable('h6', initializer= self._param['h6'])
+        layer_6 = tf.add(tf.matmul(layer_5, h6), b6)
+
+        # Finally we reshape layer_6 from a tensor of shape [n_steps*batch_size, n_hidden_6]
+        # to the slightly more useful shape [n_steps, batch_size, n_hidden_6].
+        # Note, that this differs from the input in that it is time-major.
+        layer_6 = tf.reshape(layer_6, [-1, batch_x_shape[0], self.n_hidden_6])
+
+        # Output shape: [n_steps, batch_size, n_hidden_6]
+        return layer_6
+
+
+    def do_inference(self):
+
+        g = tf.get_default_graph()
+
+        # Assign the input from the wav_file to the input_tensor to pass it further to BiRNN
+        input_tensor = tf.get_variable('input_tensor', initializer=self.input_vec)
+
+        # input_tensor needs to be of 3 dimension [ batch_size, n_steps, n_input ]
+        input_tensor = tf.expand_dims(input_tensor, axis=0)
+
+        # Calculate the sequence_length, same as the input_length
+        seq_length = [self.input_vec_len]
+
+        # Calculate the logits over the BiDirectional RNN modified as per inference part
+        logits = self.BiRNN(input_tensor, seq_length, self.no_dropout)
+
+        # Get the labels for calculating the ctc_loss
+        sparse_label = self.get_label()
+
+        # Calculate the ctc loss for logits and corresponding labels for a sequence length
+        loss = tf.nn.ctc_loss(labels=sparse_label, inputs=logits, sequence_length=seq_length)
+
+        # Average the loss
+        avg_loss = tf.reduce_mean(loss)
+
+        decoded, _ = tf.nn.ctc_beam_search_decoder(logits, seq_length, merge_repeated=True)
+        pred = tf.convert_to_tensor([tf.sparse_tensor_to_dense(sparse_tensor) for sparse_tensor in decoded])
+        dist = tf.edit_distance(tf.cast(decoded[0], tf.int32), sparse_label)
+        acc = tf.reduce_mean(dist)
+        return loss, avg_loss, dist, acc, pred, logits
+
+    def results(self, dataset):
+
+        agg_loss = 0.0
+        acc_ = 0.0
+        edit_dist = 0.0
+
+
+        for data in dataset:
+            self.set_data_set(data)
+            loss, avg_loss, dist, acc, pred, logits = self.do_inference()
+            self.session.run(tf.global_variables_initializer())
+            feed_dict = {self.target: self.label, self.target_len: self.label_len}
+
+            loss, avg_loss, dist, acc, prediction, logits = self.session.run([loss, avg_loss, dist, acc, pred, logits], feed_dict=feed_dict)
+            agg_loss += avg_loss
+            edit_dist += dist
+            acc_ += acc
+            text = ndarray_to_text(prediction[0][0])
+            # Using Language Model
+            text = correction(text)
+            print(' - src:', self.transcript)
+            print(' - res:',text)
+            print(len(prediction[0][0]), len(text), len(self.transcript), len(logits[0]))
+
+        total = len(dataset)
+        agg_loss /= total
+        edit_dist /= total
+        acc_ /= total
+        print('###############################################################')
+        print('Loss: ', agg_loss, 'Mean Edit distance: ', edit_dist, 'Accuracy: ', acc_)
+        self.session.close()
+
+
+def main(_):
+    cb = Codebook('codebook')
+
+    # Load the codebook
+    cb.load_codebook()
+
+    # Reconstruct the parameters from codebook and cluster index matrix
+    param = cb.reconstruct_param()
+
+    test_dir = os.path.join('data', FLAGS.dataset)
+    dat = Data(test_dir)
+    data = dat.get_data()
+    model = Infer(param, FLAGS.batch_size)
+    model.results(data)
+
+
+
+if __name__=='__main__':
+    tf.app.run()
+

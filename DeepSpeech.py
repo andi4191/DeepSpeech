@@ -28,6 +28,7 @@ from util.text import sparse_tensor_value_to_texts, wer
 from xdg import BaseDirectory as xdg
 import numpy as np
 
+from util.weight_sharing import CodeBook
 
 # Importer
 # ========
@@ -139,10 +140,17 @@ tf.app.flags.DEFINE_integer ('earlystop_nsteps',  4,          'number of steps t
 tf.app.flags.DEFINE_float   ('estop_mean_thresh', 0.5,        'mean threshold for loss to determine the condition if early stopping is required')
 tf.app.flags.DEFINE_float   ('estop_std_thresh',  0.5,        'standard deviation threshold for loss to determine the condition if early stopping is required')
 
+# Weight sharing for deep compression
+
+tf.app.flags.DEFINE_boolean ('weight_sharing',   True,       'enable weight sharing feature for deep compression and generating codebook for weights and their gradients')
+tf.app.flags.DEFINE_integer ('num_cluster',          4,       'number of centroids for weight sharing')
+tf.app.flags.DEFINE_string ('codebook_dir', 'codebook',       'directory for storing the codebook on trained model')
+
 for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
     tf.app.flags.DEFINE_float('%s_stddev' % var, None, 'standard deviation to use when initialising %s' % var)
 
 FLAGS = tf.app.flags.FLAGS
+
 
 def initialize_globals():
 
@@ -1569,6 +1577,13 @@ def train(server=None):
                             collect_results(report_results, batch_report[0])
                             # Add batch to total_mean_edit_distance
                             total_mean_edit_distance += batch_report[1]
+
+                    # Perform weight sharing if enabled
+                    if (job.set_name == 'train') and (FLAGS.weight_sharing is True):
+                        cb = CodeBook(FLAGS.num_cluster, FLAGS.learning_rate, extra_params, session)
+                        cb.update_codebook(avg_tower_gradients)
+                        with open(FLAGS.codebook_dir + '/codebook_file', 'wb') as fout:
+                            pickle.dump(cb.codebook, fout)
 
                     # Gathering job results
                     job.loss = total_loss / job.steps

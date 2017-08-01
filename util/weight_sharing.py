@@ -11,16 +11,20 @@ from sklearn.cluster import MiniBatchKMeans
 class CodeBook():
     def __init__(self, num_cluster, learning_rate, feed_dict,  session=None):
         self.session = session
-        self.num_clusters = {'h1': num_cluster, 'h2': num_cluster, 'h3': num_cluster, 'h5': num_cluster, 'h6': num_cluster,
-                             'b1': num_cluster, 'b2': num_cluster, 'b3': num_cluster, 'b5': num_cluster,
-                             'b6': min(4, num_cluster),
+        self.num_clusters = {'h1': num_cluster, 'h2': num_cluster/2,  'h3': num_cluster, 'h5': num_cluster/2, 'h6': num_cluster/2,
+                             'b1': num_cluster, 'b2': num_cluster/2, 'b3': num_cluster, 'b5': num_cluster/2,
+                             'b6': 29,
                              'bidirectional_rnn/fw/basic_lstm_cell/weights': num_cluster,
-                             'bidirectional_rnn/bw/basic_lstm_cell/weights': num_cluster}
+                             'bidirectional_rnn/bw/basic_lstm_cell/weights': num_cluster,
+                             'bidirectional_rnn/fw/basic_lstm_cell/biases': num_cluster,
+                             'bidirectional_rnn/bw/basic_lstm_cell/biases': num_cluster}
 
         self.param_name = {'h1': 'h1:0', 'h2': 'h2:0', 'h3': 'h3:0', 'h5': 'h5:0', 'h6': 'h6:0',
                             'b1': 'b1:0', 'b2': 'b2:0', 'b3': 'b3:0', 'b5': 'b5:0', 'b6': 'b6:0',
                             'bidirectional_rnn/fw/basic_lstm_cell/weights': 'bidirectional_rnn/fw/basic_lstm_cell/weights:0',
-                            'bidirectional_rnn/bw/basic_lstm_cell/weights': 'bidirectional_rnn/bw/basic_lstm_cell/weights:0'}
+                            'bidirectional_rnn/bw/basic_lstm_cell/weights': 'bidirectional_rnn/bw/basic_lstm_cell/weights:0',
+                            'bidirectional_rnn/fw/basic_lstm_cell/biases': 'bidirectional_rnn/fw/basic_lstm_cell/biases:0',
+                            'bidirectional_rnn/bw/basic_lstm_cell/biases': 'bidirectional_rnn/bw/basic_lstm_cell/biases:0'}
 
         self.codebook = {}
 
@@ -33,7 +37,9 @@ class CodeBook():
                              'b2': self.batch_bh_factor, 'b3': self.batch_bh_factor, 'b5': self.batch_bh_factor,
                              'b6': self.batch_b6_factor,
                              'bidirectional_rnn/fw/basic_lstm_cell/weights': self.batch_lstm_factor,
-                             'bidirectional_rnn/bw/basic_lstm_cell/weights': self.batch_lstm_factor}
+                             'bidirectional_rnn/bw/basic_lstm_cell/weights': self.batch_lstm_factor,
+                             'bidirectional_rnn/fw/basic_lstm_cell/biases': self.batch_lstm_factor,
+                             'bidirectional_rnn/bw/basic_lstm_cell/biases': self.batch_lstm_factor}
         self.learning_rate = learning_rate
         self.feed_dict = feed_dict
 
@@ -54,7 +60,7 @@ class CodeBook():
     def get_centroids(self, input_tensor, param_name):
 
         dim = 0
-        biases = ['b1', 'b2', 'b3', 'b5', 'b6']
+        biases = ['b1', 'b2', 'b3', 'b5', 'b6', 'bidirectional_rnn/fw/basic_lstm_cell/biases', 'bidirectional_rnn/bw/basic_lstm_cell/biases']
         if param_name in biases:
             dim = input_tensor.get_shape()[0]
         else:
@@ -66,9 +72,16 @@ class CodeBook():
         # Define the batch size to nearest integer
         batch_size = int(len(x)/self.batch_factor[param_name]);
 
+        # In case the sample set is less that num_clusters
+        sample_set = 3 * batch_size
+        if sample_set < self.num_clusters[param_name]:
+            sample_set = 3 * self.num_clusters[param_name]
+
+        # Perform Linear Initialization for the centroids
+        initial_centroids = np.linspace(np.amin(x), np.amax(x), num=self.num_clusters[param_name]).reshape([-1, 1])
+
         # Compute centroids using MiniBatch KMeans cluster
-        km = MiniBatchKMeans(init='k-means++', n_clusters=self.num_clusters[param_name], batch_size=batch_size,
-                            init_size=3*batch_size, n_init=10, max_no_improvement=10, verbose=0)
+        km = MiniBatchKMeans(init=initial_centroids, n_clusters=self.num_clusters[param_name], batch_size=batch_size, init_size=sample_set, n_init=1, max_no_improvement=10, verbose=0)
 
         # Reshape the predicted matrices back
         pred = np.array(km.fit_predict(x).reshape([-1, dim]), dtype=np.uint8)
@@ -78,25 +91,24 @@ class CodeBook():
         return cent, pred
 
 
-    def generate_codebook(self, param, isGradient=False, weight=None):
+    def generate_codebook_for_weight(self, param):
 
         # For each weight matrix compute the centroids
-        # If gradient then group by the weight
         codebk = {}
-        if not isGradient is True:
-            for p in param.keys():
-                cent, pred = self.get_centroids(param[p], p)
-                codebk[p] = [cent, pred]
-        else:
-            # Need to group the pred by the weight
-            for p in param.keys():
-                key = p[:-2]
-
-                # Grouping the predictions as per weight and sum up to compute the final gradient
-                codebk[key] = np.array([np.sum(k) for k in [np.take(param[p].flatten(), y) for y in [np.where(weight[key][1].flatten() == x) for x in range(self.num_clusters[key])]]]).reshape([-1, 1])
+        for p in param.keys():
+            cent, pred = self.get_centroids(param[p], p)
+            codebk[p] = [cent, pred]
 
         return codebk
 
+    def generate_codebook_for_gradient(self, param, weight):
+        # For each parameter group the gradients by weights according to cluster index
+        codebk = {}
+        for p in param.keys():
+            key = p[:-2]
+            codebk[key] = np.array([np.sum(k) for k in [np.take(param[p].flatten(), y) for y in [np.where(weight[key][1].flatten() == x) for x in range(self.num_clusters[key])]]]).reshape([-1, 1])
+
+        return codebk
 
     def get_gradients(self, avg_tower_gradients):
 
@@ -116,8 +128,8 @@ class CodeBook():
         grad = self.get_gradients(avg_tower_gradients)
 
         # Generate the codebook for current epoch weight and gradient
-        codebook_weight = self.generate_codebook(params, False, None)
-        codebook_grad = self.generate_codebook(grad, True, codebook_weight)
+        codebook_weight = self.generate_codebook_for_weight(params)
+        codebook_grad = self.generate_codebook_for_gradient(grad, codebook_weight)
 
         if not self.codebook.keys():
             self.codebook = codebook_weight

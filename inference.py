@@ -12,9 +12,11 @@ from util.text import ctc_label_dense_to_sparse, text_to_char_array, ndarray_to_
 from util.spell import correction
 import csv
 
-tf.app.flags.DEFINE_integer('batch_size',     '1',     'batch_size for inference')
-tf.app.flags.DEFINE_integer('n_hidden',     '494',     'batch_size for inference')
-tf.app.flags.DEFINE_string('dataset',          '',     'dataset to infer')
+tf.app.flags.DEFINE_integer('batch_size',     '1',     'batch_size for inference -- defaults to 1')
+tf.app.flags.DEFINE_integer('n_hidden',        '',     'batch_size for inference')
+tf.app.flags.DEFINE_string( 'dataset',         '',     'dataset to infer')
+tf.app.flags.DEFINE_string( 'codebook_dir',    '',     'path to codebook directory')
+
 FLAGS = tf.app.flags.FLAGS
 
 class Codebook():
@@ -246,6 +248,13 @@ class Infer():
             self.set_data_set(data)
             loss, avg_loss, dist, acc, pred, logits = self.do_inference()
             self.session.run(tf.global_variables_initializer())
+
+            # Assign the codebook generated parameters to LSTM cell weights
+            assign_fw_w = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/fw/basic_lstm_cell/weights:0'), self._param['bidirectional_rnn/fw/basic_lstm_cell/weights'])
+            assign_bw_w = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/bw/basic_lstm_cell/weights:0'), self._param['bidirectional_rnn/bw/basic_lstm_cell/weights'])
+            assign_fw_b = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/fw/basic_lstm_cell/biases:0'), self._param['bidirectional_rnn/fw/basic_lstm_cell/biases'].reshape([-1]))
+            assign_bw_b = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/bw/basic_lstm_cell/biases:0'), self._param['bidirectional_rnn/bw/basic_lstm_cell/biases'].reshape([-1]))
+            self.session.run([assign_fw_w, assign_bw_w, assign_fw_b, assign_bw_b])
             feed_dict = {self.target: self.label, self.target_len: self.label_len}
 
             loss, avg_loss, dist, acc, prediction, logits = self.session.run([loss, avg_loss, dist, acc, pred, logits], feed_dict=feed_dict)
@@ -269,7 +278,7 @@ class Infer():
 
 
 def main(_):
-    cb = Codebook('codebook')
+    cb = Codebook(FLAGS.codebook_dir)
 
     # Load the codebook
     cb.load_codebook()

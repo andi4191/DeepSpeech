@@ -25,6 +25,7 @@ from util.gpu import get_available_gpus
 from util.shared_lib import check_cupti
 from util.spell import correction
 from util.text import sparse_tensor_value_to_texts, wer
+from util.bnlstm import BNLSTMCell
 from xdg import BaseDirectory as xdg
 import numpy as np
 
@@ -138,6 +139,12 @@ tf.app.flags.DEFINE_boolean ('early_stop',       True,        'enable early stop
 tf.app.flags.DEFINE_integer ('earlystop_nsteps',  4,          'number of steps to consider for early stopping. Loss is not stored in the checkpoint so when checkpoint is revived it starts the loss calculation from start at that point')
 tf.app.flags.DEFINE_float   ('estop_mean_thresh', 0.5,        'mean threshold for loss to determine the condition if early stopping is required')
 tf.app.flags.DEFINE_float   ('estop_std_thresh',  0.5,        'standard deviation threshold for loss to determine the condition if early stopping is required')
+
+# Flags for BatchNorm
+tf.app.flags.DEFINE_boolean ('bn_lstm',         False,        'enable batch normalization on LSTM cells - defaults to false')
+tf.app.flags.DEFINE_boolean ('bn_fc',           False,        'enable batch normalization on non-lstm layers - defaults to false')
+tf.app.flags.DEFINE_boolean ('with_dropout',    False,        'enable dropout - defaults to false')
+tf.app.flags.DEFINE_float   ('decay',             0.9,        'decay for batch normalization - defaults to 0.9')
 
 for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
     tf.app.flags.DEFINE_float('%s_stddev' % var, None, 'standard deviation to use when initialising %s' % var)
@@ -293,6 +300,8 @@ def initialize_globals():
     global done_dequeues
     done_dequeues = [queue.dequeue() for queue in done_queues]
 
+    global is_train
+    is_train = False
 
 # Logging functions
 # =================
@@ -341,7 +350,7 @@ def variable_on_worker_level(name, shape, initializer):
         var = tf.get_variable(name=name, shape=shape, initializer=initializer)
     return var
 
-
+# Referenced from Reuben's bnlstm code
 def BiRNN(batch_x, seq_length, dropout):
     r'''
     That done, we will define the learned variables, the weights and biases,
@@ -371,43 +380,67 @@ def BiRNN(batch_x, seq_length, dropout):
     # The next three blocks will pass `batch_x` through three hidden layers with
     # clipped RELU activation and dropout.
 
+    global is_train
+    is_training = tf.Variable(is_train, trainable=False, name='is_training')
     # 1st layer
     b1 = variable_on_worker_level('b1', [n_hidden_1], tf.random_normal_initializer(stddev=FLAGS.b1_stddev))
     h1 = variable_on_worker_level('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.contrib.layers.xavier_initializer(uniform=False))
     layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), FLAGS.relu_clip)
-    layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
+    if FLAGS.with_dropout:
+        layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
+
+    if FLAGS.bn_fc:
+        layer_1 = tf.contrib.layers.batch_norm(inputs=layer_1, decay=FLAGS.decay, is_training=is_training)
 
     # 2nd layer
     b2 = variable_on_worker_level('b2', [n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.b2_stddev))
     h2 = variable_on_worker_level('h2', [n_hidden_1, n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.h2_stddev))
     layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), FLAGS.relu_clip)
-    layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
+    if FLAGS.with_dropout:
+        layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
+
+    if FLAGS.bn_fc:
+        layer_2 = tf.contrib.layers.batch_norm(inputs=layer_2, decay=FLAGS.decay, is_training=is_training)
 
     # 3rd layer
     b3 = variable_on_worker_level('b3', [n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.b3_stddev))
     h3 = variable_on_worker_level('h3', [n_hidden_2, n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.h3_stddev))
     layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), FLAGS.relu_clip)
-    layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
+    if FLAGS.with_dropout:
+        layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
+
+    if FLAGS.bn_fc:
+        layer_3 = tf.contrib.layers.batch_norm(inputs=layer_3, decay=FLAGS.decay, is_training=is_training)
 
     # Now we create the forward and backward LSTM units.
     # Both of which have inputs of length `n_cell_dim` and bias `1.0` for the forget gate of the LSTM.
 
-    # Forward direction cell: (if else required for TF 1.0 and 1.1 compat)
-    lstm_fw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True) \
-                   if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
-                   tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
-    lstm_fw_cell = tf.contrib.rnn.DropoutWrapper(lstm_fw_cell,
-                                                input_keep_prob=1.0 - dropout[3],
-                                                output_keep_prob=1.0 - dropout[3],
-                                                seed=FLAGS.random_seed)
-    # Backward direction cell: (if else required for TF 1.0 and 1.1 compat)
-    lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True) \
-                   if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
-                   tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
-    lstm_bw_cell = tf.contrib.rnn.DropoutWrapper(lstm_bw_cell,
-                                                input_keep_prob=1.0 - dropout[4],
-                                                output_keep_prob=1.0 - dropout[4],
-                                                seed=FLAGS.random_seed)
+    if FLAGS.bn_lstm:
+        # Forward cell
+        lstm_fw_cell = BNLSTMCell(n_cell_dim, is_training, max_bn_steps=100)
+
+        # Backward cell
+        lstm_bw_cell = BNLSTMCell(n_cell_dim, is_training, max_bn_steps=100)
+
+    else:
+        # Forward direction cell: (if else required for TF 1.0 and 1.1 compat)
+        lstm_fw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True) \
+                       if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
+                       tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
+        # Backward direction cell: (if else required for TF 1.0 and 1.1 compat)
+        lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True) \
+                       if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
+                       tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
+
+    if FLAGS.with_dropout:
+        lstm_fw_cell = tf.contrib.rnn.DropoutWrapper(lstm_fw_cell,
+                                                    input_keep_prob=1.0 - dropout[3],
+                                                    output_keep_prob=1.0 - dropout[3],
+                                                    seed=FLAGS.random_seed)
+        lstm_bw_cell = tf.contrib.rnn.DropoutWrapper(lstm_bw_cell,
+                                                    input_keep_prob=1.0 - dropout[4],
+                                                    output_keep_prob=1.0 - dropout[4],
+                                                    seed=FLAGS.random_seed)
 
     # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
     # as the LSTM BRNN expects its input to be of shape `[max_time, batch_size, input_size]`.
@@ -430,7 +463,11 @@ def BiRNN(batch_x, seq_length, dropout):
     b5 = variable_on_worker_level('b5', [n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.b5_stddev))
     h5 = variable_on_worker_level('h5', [(2 * n_cell_dim), n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.h5_stddev))
     layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, h5), b5)), FLAGS.relu_clip)
-    layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
+    if FLAGS.with_dropout:
+        layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
+
+    if FLAGS.bn_fc:
+        layer_5 = tf.contrib.layers.batch_norm(inputs=layer_5, decay=FLAGS.decay, is_training=is_training)
 
     # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
     # creating `n_classes` dimensional vectors, the logits.
@@ -1555,6 +1592,8 @@ def train(server=None):
                             break
 
                         log_debug('Starting batch...')
+                        global is_train
+                        is_train = True if job.set_name == 'train' else False
                         # Compute the batch
                         _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
 

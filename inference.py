@@ -266,7 +266,6 @@ class Infer():
             text = correction(text)
             print(' - src:', self.transcript)
             print(' - res:',text)
-            print(len(prediction[0][0]), len(text), len(self.transcript), len(logits[0]))
 
         total = len(dataset)
         agg_loss /= total

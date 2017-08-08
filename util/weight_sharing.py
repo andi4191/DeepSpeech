@@ -11,8 +11,8 @@ from sklearn.cluster import MiniBatchKMeans
 class CodeBook():
     def __init__(self, num_cluster, learning_rate, feed_dict,  session=None):
         self.session = session
-        self.num_clusters = {'h1': num_cluster, 'h2': num_cluster/2,  'h3': num_cluster, 'h5': num_cluster/2, 'h6': num_cluster/2,
-                             'b1': num_cluster, 'b2': num_cluster/2, 'b3': num_cluster, 'b5': num_cluster/2,
+        self.num_clusters = {'h1': num_cluster, 'h2': int(num_cluster/2),  'h3': num_cluster, 'h5': int(num_cluster/2), 'h6': int(num_cluster/2),
+                             'b1': num_cluster, 'b2': int(num_cluster/2), 'b3': num_cluster, 'b5': int(num_cluster/2),
                              'b6': 29,
                              'bidirectional_rnn/fw/basic_lstm_cell/weights': num_cluster,
                              'bidirectional_rnn/bw/basic_lstm_cell/weights': num_cluster,

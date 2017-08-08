@@ -147,7 +147,7 @@ tf.app.flags.DEFINE_float   ('prune_threshold', 0.0001,        'prune threshold 
 # Weight sharing for deep compression
 
 tf.app.flags.DEFINE_boolean ('weight_sharing',   False,        'enable weight sharing feature for deep compression - defaults to False')
-tf.app.flags.DEFINE_integer ('num_cluster',        256,       'number of centroids for weight sharing - defaults to 4')
+tf.app.flags.DEFINE_integer ('num_cluster',        256,       'number of centroids for weight sharing - defaults to 256')
 tf.app.flags.DEFINE_string ('codebook_dir', 'codebook',       'directory for storing the codebook on trained model - defaults to codebook')
 
 for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
@@ -486,14 +486,24 @@ def BiRNN_with_pruning(batch_x, seq_length, dropout):
     # The next three blocks will pass `batch_x` through three hidden layers with
     # clipped RELU activation and dropout.
 
-    global prune_mask, pruned_param, h1, h2, h3, h5, h6
+    # Need these parameters accessible to prune function for pruning
+    global prune_mask, pruned_param, h1, h2, h3, h5, h6, b1, b2, b3, b5, b6, lstm_fw_w, lstm_bw_w, lstm_fw_b, lstm_bw_b
+
+    # Need to store the mask for preventing the neurons from reviving in further steps by pruning via mask
     prune_mask = {}
+
+    # Need to store the pruned parameters for updation
     pruned_param = {}
+
     # 1st layer
     b1 = variable_on_worker_level('b1', [n_hidden_1], tf.random_normal_initializer(stddev=FLAGS.b1_stddev))
     h1 = variable_on_worker_level('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.contrib.layers.xavier_initializer(uniform=False))
     prune_mask['h1'] = tf.Variable(tf.ones_like(h1), trainable=False)
     pruned_param['h1'] = tf.multiply(h1, prune_mask['h1'])
+
+    prune_mask['b1'] = tf.Variable(tf.ones_like(b1), trainable=False)
+    pruned_param['b1'] = tf.multiply(b1, prune_mask['b1'])
+
     layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, pruned_param['h1']), b1)), FLAGS.relu_clip)
     layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
 
@@ -502,6 +512,10 @@ def BiRNN_with_pruning(batch_x, seq_length, dropout):
     h2 = variable_on_worker_level('h2', [n_hidden_1, n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.h2_stddev))
     prune_mask['h2'] = tf.Variable(tf.ones_like(h2), trainable=False)
     pruned_param['h2'] = tf.multiply(h2, prune_mask['h2'])
+
+    prune_mask['b2'] = tf.Variable(tf.ones_like(b2), trainable=False)
+    pruned_param['b2'] = tf.multiply(b2, prune_mask['b2'])
+
     layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, pruned_param['h2']), b2)), FLAGS.relu_clip)
     layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
 
@@ -510,6 +524,10 @@ def BiRNN_with_pruning(batch_x, seq_length, dropout):
     h3 = variable_on_worker_level('h3', [n_hidden_2, n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.h3_stddev))
     prune_mask['h3'] = tf.Variable(tf.ones_like(h3), trainable=False)
     pruned_param['h3'] = tf.multiply(h3, prune_mask['h3'])
+
+    prune_mask['b3'] = tf.Variable(tf.ones_like(b3), trainable=False)
+    pruned_param['b3'] = tf.multiply(b3, prune_mask['b3'])
+
     layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, pruned_param['h3']), b3)), FLAGS.relu_clip)
     layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
 
@@ -571,6 +589,10 @@ def BiRNN_with_pruning(batch_x, seq_length, dropout):
     h5 = variable_on_worker_level('h5', [(2 * n_cell_dim), n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.h5_stddev))
     prune_mask['h5'] = tf.Variable(tf.ones_like(h5), trainable=False)
     pruned_param['h5'] = tf.multiply(h5, prune_mask['h5'])
+
+    prune_mask['b5'] = tf.Variable(tf.ones_like(b5), trainable=False)
+    pruned_param['b5'] = tf.multiply(b5, prune_mask['b5'])
+
     layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, pruned_param['h5']), b5)), FLAGS.relu_clip)
     layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
 
@@ -580,6 +602,10 @@ def BiRNN_with_pruning(batch_x, seq_length, dropout):
     h6 = variable_on_worker_level('h6', [n_hidden_5, n_hidden_6], tf.contrib.layers.xavier_initializer(uniform=False))
     prune_mask['h6'] = tf.Variable(tf.ones_like(h6), trainable=False)
     pruned_param['h6'] = tf.multiply(h6, prune_mask['h6'])
+
+    prune_mask['b6'] = tf.Variable(tf.ones_like(b6), trainable=False)
+    pruned_param['b6'] = tf.multiply(b6, prune_mask['b6'])
+
     layer_6 = tf.add(tf.matmul(layer_5, pruned_param['h6']), b6)
 
     # Finally we reshape layer_6 from a tensor of shape [n_steps*batch_size, n_hidden_6]
@@ -1551,26 +1577,26 @@ def send_token_to_ps(session, kill=False):
 
 def prune():
     # Create a dict of parameters and their names
-    global params
-    params = {'h1': h1, 'h2': h2, 'h3':h3, 'h5':h5, 'h6':h6,
-            'bidirectional_rnn/fw/basic_lstm_cell/weights': [v for v in tf.global_variables() if v.name == "bidirectional_rnn/fw/basic_lstm_cell/weights:0"][0],
-            'bidirectional_rnn/bw/basic_lstm_cell/weights': [v for v in tf.global_variables() if v.name == "bidirectional_rnn/bw/basic_lstm_cell/weights:0"][0],
-            'bidirectional_rnn/fw/basic_lstm_cell/biases': [v for v in tf.global_variables() if v.name == "bidirectional_rnn/fw/basic_lstm_cell/biases:0"][0],
-            'bidirectional_rnn/bw/basic_lstm_cell/biases': [v for v in tf.global_variables() if v.name == "bidirectional_rnn/bw/basic_lstm_cell/biases:0"][0]}
+    global weights
+    weights = {'h1': h1, 'h2': h2, 'h3':h3, 'h5':h5, 'h6':h6, 'b1':b1, 'b2':b2, 'b3':b3, 'b5':b5, 'b6':b6,
+            'bidirectional_rnn/fw/basic_lstm_cell/weights': lstm_fw_w,
+            'bidirectional_rnn/bw/basic_lstm_cell/weights': lstm_bw_w,
+            'bidirectional_rnn/fw/basic_lstm_cell/biases': lstm_fw_b,
+            'bidirectional_rnn/bw/basic_lstm_cell/biases': lstm_bw_b}
 
     thresh_param = {}
     update_mask = {}
-    for p in params.keys():
-        thresh_param = tf.sqrt(tf.nn.l2_loss(params[p])) * FLAGS.prune_threshold
+    for p in weights.keys():
+        thresh_param = tf.sqrt(tf.nn.l2_loss(weights[p])) * FLAGS.prune_threshold
 
         # Filter out the elements of parameter based on multiplicative factor of their standard deviation and prune_threshold defined.
         # prune_threshold should be very small to prevent the revival of neurons again
-        mat = tf.multiply(tf.to_float(tf.greater(tf.abs(params[p]), thresh_param * tf.ones_like(params[p]))), prune_mask[p])
+        mat = tf.multiply(tf.to_float(tf.greater(tf.abs(weights[p]), thresh_param * tf.ones_like(weights[p]))), prune_mask[p])
 
         # Create the pruning mask
         update_mask[p] = tf.assign(prune_mask[p], mat)
 
-    update_op = [update_mask[p] for p in params]
+    update_op = [update_mask[p] for p in weights]
     global update_masks, percent, pruning_op
 
     # Group all the update mask ops
@@ -1578,12 +1604,12 @@ def prune():
     prune_ = {}
     percent = {}
 
-    for p in params.keys():
+    for p in weights.keys():
         # Update the parameters with pruned parameters
-        prune_[p] = tf.assign(params[p], pruned_param[p])
-        percent[p] = [tf.size(params[p]), tf.count_nonzero(params[p])]
+        prune_[p] = tf.assign(weights[p], pruned_param[p])
+        percent[p] = [tf.size(weights[p]), tf.count_nonzero(weights[p])]
 
-    assign_op = [prune_[p] for p in params]
+    assign_op = [prune_[p] for p in weights]
 
     # Group all the updation ops for parameters
     pruning_op = tf.group(*assign_op)
@@ -1762,7 +1788,7 @@ def train(server=None):
                     if (job.set_name == 'train') and FLAGS.pruning and is_chief:
                         session.run([update_masks, pruning_op], **extra_params)
                     if (job.set_name == 'test') and FLAGS.pruning and is_chief:
-                        for p in params.keys():
+                        for p in weights.keys():
                             size, non_zero = session.run(percent[p], **extra_params)
                             log_info('Parameter %s pruned to %f %%' % (p, 100*(size-non_zero)/size))
 

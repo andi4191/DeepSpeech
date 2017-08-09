@@ -6,8 +6,15 @@ if [ ! $DATASET ]; then
     echo "Usage ./bin/prune.sh  [ldc93s1 | ted] "
     exit
 fi;
-EXTRA_PARAM="${@:2}"
-if [ $DATASET == "ldc93s1" ]; then
+
+EXTRA_PARAM=$@
+# Removing the data set from the argument list
+EXTRA_PARAM="$(echo $EXTRA_PARAM | cut -d ' ' --complement -s -f1)"
+if [ ! -d "${COMPUTE_DATA_DIR}" ]; then
+    COMPUTE_DATA_DIR="data"
+fi;
+
+if [ "$DATASET" = "ldc93s1" ]; then
     DATA_DIR='./data/ldc93s1'
     TRAIN_FILE='data/ldc93s1/ldc93s1.csv'
     DEV_FILE='data/ldc93s1/ldc93s1.csv'
@@ -19,11 +26,11 @@ if [ $DATASET == "ldc93s1" ]; then
     DEV_BATCH_SIZE=1
     TEST_BATCH_SIZE=1
 
-elif [ $DATASET == "ted" ]; then
+elif [ "$DATASET" = "ted" ]; then
     DATA_DIR='./data/ted'
-    TRAIN_FILE='data/ted/ted-train.csv'
-    DEV_FILE='data/ted/ted-dev.csv'
-    TEST_FILE='data/ted/ted-test.csv'
+    TRAIN_FILE="$COMPUTE_DATA_DIR/ted-train.csv"
+    DEV_FILE="$COMPUTE_DATA_DIR/ted-dev.csv"
+    TEST_FILE="$COMPUTE_DATA_DIR/ted-test.csv"
     IMPORTER='bin/import_ted.py'
     EPOCH=10
     N_HIDDEN=2048
@@ -40,7 +47,7 @@ if [ ! -f DeepSpeech.py ]; then
     exit 1
 fi;
 
-if [ ! -f "data/ldc93s1/ldc93s1.csv" ]; then
+if [ ! -f "$TRAIN_FILE" ]; then
     #echo "Downloading and preprocessing LDC93S1 example data, saving in ./data/ldc93s1."
     python -u $IMPORTER $DATA_DIR
 fi;

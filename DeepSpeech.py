@@ -1249,6 +1249,7 @@ class TrainingCoordinator(object):
         self._init()
         self._lock = Lock()
         self.started = False
+        self.generate_codebook = False
         if is_chief:
             self._httpd = BaseHTTPServer.HTTPServer((FLAGS.coord_host, FLAGS.coord_port), TrainingCoordinator.TrainingCoordinationHandler)
 
@@ -1262,6 +1263,7 @@ class TrainingCoordinator(object):
         self._epochs_done = []
         self._reset_counters()
         self._dev_losses = []
+
 
     def _log_all_jobs(self):
         '''Use this to debug-print epoch state'''
@@ -1401,6 +1403,7 @@ class TrainingCoordinator(object):
         if result:
             # Increment the epoch index - shared among train and test 'state'
             self._epoch += 1
+            self.generate_codebook = True
         return result
 
     def _end_training(self):
@@ -1784,20 +1787,26 @@ def train(server=None):
                             # Add batch to total_mean_edit_distance
                             total_mean_edit_distance += batch_report[1]
 
-                    # Perform the pruning part after every epoch
-                    if (job.set_name == 'train') and FLAGS.pruning and is_chief:
-                        session.run([update_masks, pruning_op], **extra_params)
-                    if (job.set_name == 'test') and FLAGS.pruning and is_chief:
-                        for p in weights.keys():
-                            size, non_zero = session.run(percent[p], **extra_params)
-                            log_info('Parameter %s pruned to %f %%' % (p, 100*(size-non_zero)/size))
+                        if (job_step == job.steps-1):
+                            # Perform the pruning part for a job
+                            if (job.set_name == 'train') and FLAGS.pruning and is_chief:
+                                session.run([update_masks, pruning_op], **extra_params)
 
-                    # Perform weight sharing if enabled
-                    if (job.set_name == 'train') and (FLAGS.weight_sharing is True):
-                        cb = CodeBook(FLAGS.num_cluster, FLAGS.learning_rate, extra_params, session)
-                        cb.update_codebook(avg_tower_gradients)
-                        with open(FLAGS.codebook_dir + '/codebook_file', 'wb') as fout:
-                            pickle.dump(cb.codebook, fout)
+                            if (job.set_name == 'test') and FLAGS.pruning and is_chief:
+                                for p in weights.keys():
+                                    size, non_zero = session.run(percent[p], **extra_params)
+                                    log_info('Parameter %s pruned to %f %%' % (p, 100*(size-non_zero)/size))
+
+                            # Perform weight sharing if enabled at every epoch
+                            if (COORD.generate_codebook == True) and (job.set_name == 'train') and (FLAGS.weight_sharing is True):
+                                cb = CodeBook(FLAGS.num_cluster, FLAGS.learning_rate, extra_params, session)
+                                cb.update_codebook(avg_tower_gradients)
+                                log_debug('Updating codebook')
+                                with open(FLAGS.codebook_dir + '/codebook_file', 'wb') as fout:
+                                    pickle.dump(cb.codebook, fout)
+                                    fout.close()
+
+                                COORD.generate_codebook = False
 
                     # Gathering job results
                     job.loss = total_loss / job.steps

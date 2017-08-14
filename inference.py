@@ -85,9 +85,21 @@ class Infer():
         # Parse and modify the input to compatible format
         self.target = tf.placeholder(tf.int32, [self.batch_size, None])
         self.target_len = tf.placeholder(tf.int32, [self.batch_size])
+        self.input_tensor = tf.placeholder(tf.int32, [None, self.n_input + 2 * (self.n_input*self.n_context)])
+        self.input_len = tf.placeholder(tf.int32, [self.batch_size])
 
-    def set_data_set(self, data):
-        self.input_vec, self.input_vec_len, self.label, self.label_len, self.transcript = self.retrieve_data(data)
+    def get_embeddings(self, data):
+
+        wav_file, _, transcript = data
+
+        # Get the input from the wav_file
+        input_vec = audiofile_to_input_vector(wav_file, self.n_input, self.n_context)
+
+        # Convert the transcript to array
+        target = text_to_char_array(transcript)
+
+        return input_vec, np.asarray(target).reshape(self.batch_size, -1), transcript
+
 
     def retrieve_data(self, data):
         wav_file, _, transcript = data
@@ -99,21 +111,6 @@ class Infer():
         target = text_to_char_array(transcript)
 
         return input_vec, len(input_vec), target, len(target), transcript
-
-
-    def get_label(self):
-
-        # Reshape the target label
-        self.label = np.reshape(self.label, (self.batch_size, -1))
-        self.label_len = np.reshape(self.label_len, (self.batch_size))
-
-        feed_dict = {self.target: self.label, self.target_len: self.label_len}
-
-        # Generate the Sparse Tensor for computation of CTC loss
-        sparse_labels  = ctc_label_dense_to_sparse(self.target, self.target_len, self.batch_size)
-        self.session.run([sparse_labels], feed_dict=feed_dict)
-
-        return sparse_labels
 
 
     def BiRNN(self, batch_x, seq_length, dropout):
@@ -208,22 +205,17 @@ class Infer():
 
     def do_inference(self):
 
-        g = tf.get_default_graph()
-
-        # Assign the input from the wav_file to the input_tensor to pass it further to BiRNN
-        input_tensor = tf.get_variable('input_tensor', initializer=self.input_vec)
-
         # input_tensor needs to be of 3 dimension [ batch_size, n_steps, n_input ]
-        input_tensor = tf.expand_dims(input_tensor, axis=0)
+        input_tensor = tf.expand_dims(self.input_tensor, axis=0)
 
         # Calculate the sequence_length, same as the input_length
-        seq_length = [self.input_vec_len]
+        seq_length = self.input_len
 
         # Calculate the logits over the BiDirectional RNN modified as per inference part
         logits = self.BiRNN(input_tensor, seq_length, self.no_dropout)
 
         # Get the labels for calculating the ctc_loss
-        sparse_label = self.get_label()
+        sparse_label = ctc_label_dense_to_sparse(self.target, self.target_len, self.batch_size)
 
         # Calculate the ctc loss for logits and corresponding labels for a sequence length
         loss = tf.nn.ctc_loss(labels=sparse_label, inputs=logits, sequence_length=seq_length)
@@ -237,42 +229,59 @@ class Infer():
         acc = tf.reduce_mean(dist)
         return loss, avg_loss, dist, acc, pred, logits
 
+
+    def init_lstm_param(self):
+
+        # Assign the codebook generated parameters to LSTM cell weights
+        assign_fw_w = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/fw/basic_lstm_cell/weights:0'), self._param['bidirectional_rnn/fw/basic_lstm_cell/weights'])
+        assign_bw_w = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/bw/basic_lstm_cell/weights:0'), self._param['bidirectional_rnn/bw/basic_lstm_cell/weights'])
+        assign_fw_b = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/fw/basic_lstm_cell/biases:0'), self._param['bidirectional_rnn/fw/basic_lstm_cell/biases'].reshape([-1]))
+        assign_bw_b = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/bw/basic_lstm_cell/biases:0'), self._param['bidirectional_rnn/bw/basic_lstm_cell/biases'].reshape([-1]))
+
+        return assign_fw_w, assign_bw_w, assign_fw_b, assign_bw_b
+
     def results(self, dataset):
 
         agg_loss = 0.0
-        acc_ = 0.0
+        _acc = 0.0
         edit_dist = 0.0
 
+        loss, avg_loss, dist, acc, pred, logits = self.do_inference()
+        assign_fw_w, assign_bw_w, assign_fw_b, assign_bw_b = self.init_lstm_param()
 
         for data in dataset:
-            self.set_data_set(data)
-            loss, avg_loss, dist, acc, pred, logits = self.do_inference()
+            # Retrive the input data
+            input_x, target, transcript = self.get_embeddings(data)
+
+            # Initialize the variables defined in the graph
             self.session.run(tf.global_variables_initializer())
 
-            # Assign the codebook generated parameters to LSTM cell weights
-            assign_fw_w = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/fw/basic_lstm_cell/weights:0'), self._param['bidirectional_rnn/fw/basic_lstm_cell/weights'])
-            assign_bw_w = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/bw/basic_lstm_cell/weights:0'), self._param['bidirectional_rnn/bw/basic_lstm_cell/weights'])
-            assign_fw_b = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/fw/basic_lstm_cell/biases:0'), self._param['bidirectional_rnn/fw/basic_lstm_cell/biases'].reshape([-1]))
-            assign_bw_b = tf.assign(self.session.graph.get_tensor_by_name('bidirectional_rnn/bw/basic_lstm_cell/biases:0'), self._param['bidirectional_rnn/bw/basic_lstm_cell/biases'].reshape([-1]))
+            # LSTM param initialization
             self.session.run([assign_fw_w, assign_bw_w, assign_fw_b, assign_bw_b])
-            feed_dict = {self.target: self.label, self.target_len: self.label_len}
 
-            loss, avg_loss, dist, acc, prediction, logits = self.session.run([loss, avg_loss, dist, acc, pred, logits], feed_dict=feed_dict)
-            agg_loss += avg_loss
-            edit_dist += dist
-            acc_ += acc
+            seq_len = [len(input_x)]
+            target_len = np.asarray([len(target[j]) for j in range(self.batch_size)])
+            target = target.reshape(self.batch_size, -1)
+
+            # Create the dictionary to feed the placeholders defined in the graph
+            feed_dict = {self.target: target, self.target_len: target_len, self.input_tensor: input_x, self.input_len: seq_len}
+            loss_, avg_loss_, dist_, acc_, prediction = self.session.run([loss, avg_loss, dist, acc, pred], feed_dict=feed_dict)
+            agg_loss += avg_loss_
+            edit_dist += dist_
+            _acc += acc_
             text = ndarray_to_text(prediction[0][0])
+
             # Using Language Model
             text = correction(text)
-            print(' - src:', self.transcript)
+            print(' - src:', transcript)
             print(' - res:',text)
 
         total = len(dataset)
         agg_loss /= total
         edit_dist /= total
-        acc_ /= total
+        _acc /= total
         print('###############################################################')
-        print('Loss: ', agg_loss, 'Mean Edit distance: ', edit_dist, 'Accuracy: ', acc_)
+        print('Loss: ', agg_loss, 'Mean Edit distance: ', edit_dist, 'Accuracy: ', _acc)
         self.session.close()
 
 

@@ -8,7 +8,7 @@ import tensorflow as tf
 import sys
 import inspect
 from util.audio import audiofile_to_input_vector
-from util.text import ctc_label_dense_to_sparse, text_to_char_array, ndarray_to_text
+from util.text import ctc_label_dense_to_sparse, text_to_char_array, ndarray_to_text, wer
 from util.spell import correction
 import csv
 
@@ -16,6 +16,7 @@ tf.app.flags.DEFINE_integer('batch_size',     '1',     'batch_size for inference
 tf.app.flags.DEFINE_integer('n_hidden',        '',     'batch_size for inference')
 tf.app.flags.DEFINE_string( 'dataset',         '',     'dataset to infer')
 tf.app.flags.DEFINE_string( 'codebook_dir',    '',     'path to codebook directory')
+tf.app.flags.DEFINE_integer('num_report',      10 ,    'number of sample results to report - defaults to 10 ')
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -223,7 +224,7 @@ class Infer():
         # Average the loss
         avg_loss = tf.reduce_mean(loss)
 
-        decoded, _ = tf.nn.ctc_beam_search_decoder(logits, seq_length, merge_repeated=True)
+        decoded, _ = tf.nn.ctc_beam_search_decoder(logits, seq_length, merge_repeated=False)
         pred = tf.convert_to_tensor([tf.sparse_tensor_to_dense(sparse_tensor) for sparse_tensor in decoded])
         dist = tf.edit_distance(tf.cast(decoded[0], tf.int32), sparse_label)
         acc = tf.reduce_mean(dist)
@@ -249,12 +250,15 @@ class Infer():
         loss, avg_loss, dist, acc, pred, logits = self.do_inference()
         assign_fw_w, assign_bw_w, assign_fw_b, assign_bw_b = self.init_lstm_param()
 
-        for data in dataset:
+        # Initialize the variables defined in the graph
+        self.session.run(tf.global_variables_initializer())
+
+        samples = []
+        sum_wer = 0.0
+
+        for idx,data in enumerate(dataset):
             # Retrive the input data
             input_x, target, transcript = self.get_embeddings(data)
-
-            # Initialize the variables defined in the graph
-            self.session.run(tf.global_variables_initializer())
 
             # LSTM param initialization
             self.session.run([assign_fw_w, assign_bw_w, assign_fw_b, assign_bw_b])
@@ -273,15 +277,23 @@ class Infer():
 
             # Using Language Model
             text = correction(text)
-            print(' - src:', transcript)
-            print(' - res:',text)
+            wer_value = wer(transcript, text)
+            sum_wer += wer_value
+            samples.append((wer_value, transcript, text, avg_loss_, dist_))
+            print('Processed %d inputs out of %d ...' % (idx+1, len(dataset)))
+
+        sorted(samples, key=lambda x: x[0], reverse=True)
+        for i in range(FLAGS.num_report):
+            print(' WER: %f Loss: %f mean edit distance: %f' % (samples[i][0], samples[i][3], samples[i][4]))
+            print(' - src: %s' % samples[i][1])
+            print(' - res: %s\n\n' % samples[i][2])
 
         total = len(dataset)
         agg_loss /= total
         edit_dist /= total
-        _acc /= total
+        sum_wer /= total
         print('###############################################################')
-        print('Loss: ', agg_loss, 'Mean Edit distance: ', edit_dist, 'Accuracy: ', _acc)
+        print('WER: %f Loss: %f Mean Edit distance: %f' %( sum_wer, agg_loss,  edit_dist))
         self.session.close()
 
 

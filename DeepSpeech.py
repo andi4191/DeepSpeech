@@ -141,8 +141,9 @@ tf.app.flags.DEFINE_float   ('estop_mean_thresh', 0.5,        'mean threshold fo
 tf.app.flags.DEFINE_float   ('estop_std_thresh',  0.5,        'standard deviation threshold for loss to determine the condition if early stopping is required')
 
 # Pruning parameters for deep compression
-tf.app.flags.DEFINE_boolean ('pruning',          False,        'enable pruning of parameters - defaults to False')
-tf.app.flags.DEFINE_float   ('prune_threshold', 0.0001,        'prune threshold - defaults to 0.0001')
+tf.app.flags.DEFINE_boolean ('pruning',                       False,        'enable pruning of parameters - defaults to False')
+tf.app.flags.DEFINE_float   ('prune_threshold_weight',       0.0001,        'prune threshold for weights - defaults to 0.0001')
+tf.app.flags.DEFINE_float   ('prune_threshold_bias',         0.0001,        'prune threshold for biases - defaults to 0.0001')
 
 # Weight sharing for deep compression
 
@@ -1587,10 +1588,15 @@ def prune():
             'bidirectional_rnn/fw/basic_lstm_cell/biases': lstm_fw_b,
             'bidirectional_rnn/bw/basic_lstm_cell/biases': lstm_bw_b}
 
+    biases = ['b1' ,'b2', 'b3', 'b5', 'b6', 'bidirectional_rnn/fw/basic_lstm_cell/biases', 'bidirectional_rnn/bw/basic_lstm_cell/biases']
     thresh_param = {}
     update_mask = {}
     for p in weights.keys():
-        thresh_param = tf.sqrt(tf.nn.l2_loss(weights[p])) * FLAGS.prune_threshold
+        thresh_param = 0.0
+        if p in biases:
+            thresh_param = tf.sqrt(tf.nn.l2_loss(weights[p])) * FLAGS.prune_threshold_bias
+        else:
+            thresh_param = tf.sqrt(tf.nn.l2_loss(weights[p])) * FLAGS.prune_threshold_weight
 
         # Filter out the elements of parameter based on multiplicative factor of their standard deviation and prune_threshold defined.
         # prune_threshold should be very small to prevent the revival of neurons again

@@ -283,16 +283,17 @@ class Infer():
             print('Processed %d inputs out of %d ...' % (idx+1, len(dataset)))
 
         sorted(samples, key=lambda x: x[0], reverse=True)
-        for i in range(FLAGS.num_report):
+        print('---------------------------------------------------------------')
+        for i in range(len(dataset)%FLAGS.num_report):
             print(' WER: %f Loss: %f mean edit distance: %f' % (samples[i][0], samples[i][3], samples[i][4]))
             print(' - src: %s' % samples[i][1])
-            print(' - res: %s\n\n' % samples[i][2])
+            print(' - res: %s\n' % samples[i][2])
 
         total = len(dataset)
         agg_loss /= total
         edit_dist /= total
         sum_wer /= total
-        print('###############################################################')
+        print('---------------------------------------------------------------')
         print('WER: %f Loss: %f Mean Edit distance: %f' %( sum_wer, agg_loss,  edit_dist))
         self.session.close()
 

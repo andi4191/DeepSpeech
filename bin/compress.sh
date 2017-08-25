@@ -20,10 +20,11 @@ if [ "$DATASET" = "ldc93s1" ]; then
     DEV_FILE='data/ldc93s1/ldc93s1.csv'
     TEST_FILE='data/ldc93s1/ldc93s1.csv'
     IMPORTER='bin/import_ldc93s1.py'
-    EPOCH=50
+    EPOCH=70
     N_HIDDEN=494
     TRAIN_BATCH_SIZE=1
     DEV_BATCH_SIZE=1
+    PR_THRESH_WEIGHT=0.0001
     TEST_BATCH_SIZE=1
 
 elif [ "$DATASET" = "ted" ]; then
@@ -37,6 +38,7 @@ elif [ "$DATASET" = "ted" ]; then
     TRAIN_BATCH_SIZE=16
     DEV_BATCH_SIZE=8
     TEST_BATCH_SIZE=8
+    PR_THRESH_WEIGHT=0.00001
     EXTRA_PARAM="--dropout_rate 0.30 --default_stddev 0.046875 --learning_rate 0.0001 --validtion_step 1 --display_step 10 $EXTRA_PARAM"
 
 fi;
@@ -75,6 +77,7 @@ train()
         --weight_sharing True \
         --pruning True \
         --codebook_dir "$codebook_dir" \
+        --prune_threshold_weight $PR_THRESH_WEIGHT \
         $EXTRA_PARAM
 }
 
